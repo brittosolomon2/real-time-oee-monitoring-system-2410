@@ -1,1 +1,3 @@
-# real-time-oee-monitoring-system-2410
+# Project Repository
+
+This is the initial README file for the project.
