@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 from urllib.parse import urlparse
 
@@ -23,19 +24,101 @@ def _to_asyncpg_sqlalchemy_url(url: str) -> str:
     return url
 
 
+def _read_db_url_from_connection_txt(path: Path) -> Optional[str]:
+    """
+    Read a Postgres URL from a db_connection.txt-style file.
+
+    Supported formats:
+    - "psql postgresql://user:pass@host:port/db"
+    - "postgresql://user:pass@host:port/db"
+    """
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    if not raw:
+        return None
+
+    # Most commonly: "psql postgresql://..."
+    parts = raw.split()
+    candidate = parts[-1].strip()
+
+    if candidate.startswith(("postgresql://", "postgres://", "postgresql+asyncpg://")):
+        return candidate
+    return None
+
+
+def _discover_db_connection_txt() -> Optional[Path]:
+    """
+    Attempt to discover db_connection.txt in common locations for preview/dev.
+
+    This is primarily intended for Kavia preview where the repo includes both:
+    - oee_backend
+    - oee_database (which writes db_connection.txt)
+
+    Search order:
+    1) DB_CONNECTION_PATH env var
+    2) ./db_connection.txt (current working dir)
+    3) <oee_backend>/db_connection.txt (relative to this file)
+    4) Any real-time-oee-monitoring-system-*/oee_database/db_connection.txt under repo root
+    5) Any parent/.../oee_database/db_connection.txt while walking up
+    """
+    env_path = (os.getenv("DB_CONNECTION_PATH") or "").strip()
+    if env_path:
+        p = Path(env_path).expanduser()
+        return p if p.exists() else None
+
+    candidates: list[Path] = []
+
+    # cwd is typically container_root in preview
+    candidates.append(Path.cwd() / "db_connection.txt")
+
+    # session.py is at: <...>/oee_backend/src/db/session.py
+    this_file = Path(__file__).resolve()
+    oee_backend_dir = this_file.parents[2]
+    candidates.append(oee_backend_dir / "db_connection.txt")
+
+    # Try to find sibling workspace oee_database under the repo root
+    repo_root = this_file
+    for _ in range(10):
+        if (repo_root / ".project_manifest.yaml").exists():
+            break
+        if repo_root.parent == repo_root:
+            break
+        repo_root = repo_root.parent
+
+    # Known monorepo pattern: real-time-oee-monitoring-system-*/oee_database/db_connection.txt
+    try:
+        candidates.extend(repo_root.glob("real-time-oee-monitoring-system-*/oee_database/db_connection.txt"))
+    except OSError:
+        # If glob fails for any reason, ignore and rely on other candidates.
+        pass
+
+    # Walk up parents for a simple colocated pattern: <parent>/oee_database/db_connection.txt
+    for parent in this_file.parents:
+        candidates.append(parent / "oee_database" / "db_connection.txt")
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+
+    return None
+
+
 def _build_db_url() -> str:
     """
     Build an async SQLAlchemy URL for Postgres using cross-container conventions.
 
     Priority:
     1) DATABASE_URL (recommended; may be copied from db_connection.txt but with async driver)
-    2) POSTGRES_* environment variables (as provided by the database container)
-    3) DB_CONNECTION_URL (optional convenience env var that mirrors db_connection.txt)
+    2) DB_CONNECTION_URL (optional convenience env var that mirrors db_connection.txt URL)
+    3) db_connection.txt file discovery (preview/dev convenience)
+    4) POSTGRES_* environment variables (as provided by the database container)
 
     Notes:
-    - db_connection.txt commonly contains: psql postgresql://user:pass@host:port/db
-      This module supports using that URL via DATABASE_URL/DB_CONNECTION_URL without needing to
-      duplicate host/user/pass into multiple env vars.
+    - db_connection.txt commonly contains: "psql postgresql://user:pass@host:port/db"
+      This module supports using that URL without needing to duplicate host/user/pass into multiple env vars.
     """
     direct = (os.getenv("DATABASE_URL") or "").strip()
     if direct:
@@ -44,6 +127,13 @@ def _build_db_url() -> str:
     conn_url = (os.getenv("DB_CONNECTION_URL") or "").strip()
     if conn_url:
         return _to_asyncpg_sqlalchemy_url(conn_url)
+
+    # Preview/dev fallback: discover db_connection.txt written by the DB container
+    conn_txt = _discover_db_connection_txt()
+    if conn_txt:
+        txt_url = _read_db_url_from_connection_txt(conn_txt)
+        if txt_url:
+            return _to_asyncpg_sqlalchemy_url(txt_url)
 
     host = os.getenv("POSTGRES_URL")
     user = os.getenv("POSTGRES_USER")
@@ -61,35 +151,44 @@ def _build_db_url() -> str:
         p_port: Optional[int] = int(port) if port else (parsed.port or None)
         p_db: Optional[str] = db or (parsed.path.lstrip("/") or None)
 
-        missing = [k for k, v in {
-            "POSTGRES_USER": p_user,
-            "POSTGRES_PASSWORD": p_pass,
-            "POSTGRES_URL(host)": p_host,
-            "POSTGRES_PORT": p_port,
-            "POSTGRES_DB": p_db,
-        }.items() if not v]
+        missing = [
+            k
+            for k, v in {
+                "POSTGRES_USER": p_user,
+                "POSTGRES_PASSWORD": p_pass,
+                "POSTGRES_URL(host)": p_host,
+                "POSTGRES_PORT": p_port,
+                "POSTGRES_DB": p_db,
+            }.items()
+            if not v
+        ]
         if missing:
             raise RuntimeError(
                 "Missing required DB settings: "
                 + ", ".join(missing)
-                + ". Provide DATABASE_URL (preferred) or set POSTGRES_* env vars."
+                + ". Provide DATABASE_URL (preferred), DB_CONNECTION_URL, "
+                + "DB_CONNECTION_PATH, or set POSTGRES_* env vars."
             )
         return f"postgresql+asyncpg://{p_user}:{p_pass}@{p_host}:{p_port}/{p_db}"
 
     # Classic split vars case: POSTGRES_URL is expected to be a host (or host:port).
-    missing = [k for k, v in {
-        "POSTGRES_URL": host,
-        "POSTGRES_USER": user,
-        "POSTGRES_PASSWORD": password,
-        "POSTGRES_DB": db,
-        "POSTGRES_PORT": port,
-    }.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "POSTGRES_URL": host,
+            "POSTGRES_USER": user,
+            "POSTGRES_PASSWORD": password,
+            "POSTGRES_DB": db,
+            "POSTGRES_PORT": port,
+        }.items()
+        if not v
+    ]
     if missing:
         raise RuntimeError(
-            "Missing required DB env vars: "
+            "Missing required DB settings: "
             + ", ".join(missing)
-            + ". Provide DATABASE_URL (preferred; can be derived from db_connection.txt) "
-              "or ask orchestrator to set POSTGRES_* env vars in the container .env."
+            + ". Provide DATABASE_URL (preferred), DB_CONNECTION_URL, "
+            + "DB_CONNECTION_PATH (pointing to db_connection.txt), or set POSTGRES_* env vars."
         )
 
     host_only = host.split(":")[0]
