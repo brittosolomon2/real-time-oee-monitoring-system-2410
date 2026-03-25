@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
@@ -40,6 +40,7 @@ openapi_tags = [
     {"name": "Alerts", "description": "Persisted alerts when OEE drops or other conditions occur."},
     {"name": "Reports", "description": "Shift handover report generation."},
     {"name": "Realtime", "description": "WebSocket endpoints for live OEE/alerts broadcasting."},
+    {"name": "Smoke", "description": "Helper endpoints to validate end-to-end flows in preview."},
 ]
 
 manager = ConnectionManager()
@@ -283,6 +284,174 @@ async def shift_report(
         window_start=window_start,
         window_end=window_end,
     )
+
+
+# WebSocket
+@router.post(
+    "/smoke/flow",
+    tags=["Smoke"],
+    summary="Run an end-to-end smoke flow (event → OEE → alert → report)",
+)
+async def smoke_flow(
+    *,
+    db: AsyncSession = Depends(get_db_session),
+    line_name: str = Query("Line A", description="Line name to create/use."),
+    target_oee: float = Query(0.85, ge=0.0, le=1.0, description="Target OEE for the line."),
+    product_code: str = Query("SKU-1", description="Product code to attach to run."),
+    ideal_cycle_time_s: float = Query(1.0, gt=0, description="Ideal cycle time (s/part)."),
+    planned_production_time_s: int = Query(
+        3600, gt=0, description="Planned production time (seconds) used for OEE."
+    ),
+    good_count: int = Query(10, ge=0, description="Good count for production event."),
+    scrap_count: int = Query(0, ge=0, description="Scrap count for production event."),
+    force_downtime_s: int = Query(
+        0, ge=0, description="Optional downtime event duration to reduce availability."
+    ),
+) -> dict:
+    """
+    End-to-end helper for preview smoke testing.
+
+    It ensures there is:
+    - a Line
+    - a Shift covering 'now'
+    - a Run started at 'now - 10 minutes'
+
+    Then it:
+    - creates a PRODUCTION event (and optional DOWNTIME event)
+    - computes OEE for the run
+    - triggers an alert if OEE < target
+    - generates a shift report for the last 30 minutes window
+
+    Returns a JSON payload with created ids and computed artifacts so frontend can validate
+    the full flow quickly.
+    """
+    # Ensure line exists
+    line = (await db.execute(select(Line).where(Line.name == line_name))).scalar_one_or_none()
+    if not line:
+        line = Line(name=line_name, target_oee=target_oee)
+        db.add(line)
+        await db.commit()
+        await db.refresh(line)
+
+    now = datetime.now(timezone.utc)
+
+    # Ensure a shift exists for the current window (simple: last 8 hours)
+    shift_start = now - timedelta(hours=4)
+    shift_end = now + timedelta(hours=4)
+    shift = (
+        await db.execute(
+            select(Shift)
+            .where(Shift.line_id == line.id)
+            .where(Shift.start_ts <= now)
+            .where(Shift.end_ts >= now)
+            .order_by(Shift.start_ts.desc())
+        )
+    ).scalar_one_or_none()
+    if not shift:
+        shift = Shift(line_id=line.id, name="Shift (auto)", start_ts=shift_start, end_ts=shift_end)
+        db.add(shift)
+        await db.commit()
+        await db.refresh(shift)
+
+    # Create a run (always new to keep the smoke idempotent-ish)
+    run = Run(
+        line_id=line.id,
+        shift_id=shift.id,
+        product_code=product_code,
+        ideal_cycle_time_s=ideal_cycle_time_s,
+        planned_production_time_s=planned_production_time_s,
+        started_at=now - timedelta(minutes=10),
+        ended_at=None,
+    )
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    # Optional downtime event
+    if force_downtime_s and force_downtime_s > 0:
+        e_dt = Event(
+            line_id=line.id,
+            run_id=run.id,
+            ts=now - timedelta(minutes=5),
+            type=EventType.DOWNTIME,
+            good_count=None,
+            scrap_count=None,
+            downtime_reason="Smoke downtime",
+            downtime_duration_s=int(force_downtime_s),
+            notes="Smoke flow injected downtime.",
+        )
+        db.add(e_dt)
+        await db.commit()
+
+    # Production event
+    e_prod = Event(
+        line_id=line.id,
+        run_id=run.id,
+        ts=now,
+        type=EventType.PRODUCTION,
+        good_count=int(good_count),
+        scrap_count=int(scrap_count),
+        downtime_reason=None,
+        downtime_duration_s=None,
+        notes="Smoke flow production event.",
+    )
+    db.add(e_prod)
+    await db.commit()
+    await db.refresh(e_prod)
+
+    # Compute OEE and trigger/broadcast
+    events = (
+        await db.execute(select(Event).where(Event.run_id == run.id).order_by(Event.ts.asc()))
+    ).scalars().all()
+    oee_res = compute_oee_for_run(run, events)
+
+    alert = await maybe_create_oee_alert(
+        db,
+        line_id=line.id,
+        run_id=run.id,
+        shift_id=run.shift_id,
+        oee_result=oee_res,
+    )
+
+    oee_out = OEEOut(
+        availability=oee_res.availability,
+        performance=oee_res.performance,
+        quality=oee_res.quality,
+        oee=oee_res.oee,
+        good_count=oee_res.good_count,
+        scrap_count=oee_res.scrap_count,
+        downtime_s=oee_res.downtime_s,
+        runtime_s=oee_res.runtime_s,
+        planned_production_time_s=oee_res.planned_production_time_s,
+    )
+
+    await manager.broadcast(
+        {"type": "oee_update", "line_id": run.line_id, "run_id": run.id, "oee": oee_out.model_dump()}
+    )
+    if alert:
+        await manager.broadcast({"type": "alert", "alert": AlertOut.model_validate(alert).model_dump()})
+
+    # Generate a small report window
+    window_start = now - timedelta(minutes=30)
+    window_end = now
+    report = await generate_shift_report(
+        db,
+        line_id=line.id,
+        shift_id=shift.id,
+        run_id=run.id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    return {
+        "line": LineOut.model_validate(line).model_dump(),
+        "shift": ShiftOut.model_validate(shift).model_dump(),
+        "run": RunOut.model_validate(run).model_dump(),
+        "event": EventOut.model_validate(e_prod).model_dump(),
+        "oee": oee_out.model_dump(),
+        "alert": AlertOut.model_validate(alert).model_dump() if alert else None,
+        "report": report.model_dump(),
+    }
 
 
 # WebSocket
