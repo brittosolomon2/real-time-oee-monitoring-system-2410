@@ -40,7 +40,16 @@ typing_extensions==4.13.1
 uvicorn==0.34.0
 uvloop==0.21.0
 watchfiles==1.0.5
+sqlalchemy==2.0.37
+asyncpg==0.30.0
+alembic==1.14.1
+=======
+
+=======
 websockets==15.0.1
+sqlalchemy==2.0.37
+asyncpg==0.30.0
+alembic==1.14.1
 =======
 sqlalchemy==2.0.37
 asyncpg==0.30.0

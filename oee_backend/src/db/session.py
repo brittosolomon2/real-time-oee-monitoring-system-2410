@@ -49,11 +49,11 @@ def _read_db_url_from_connection_txt(path: Path) -> Optional[str]:
     return None
 
 
-def _discover_db_connection_txt() -> Optional[Path]:
+def _discover_db_connection_txt(start_file: Optional[Path] = None) -> Optional[Path]:
     """
     Attempt to discover db_connection.txt in common locations for preview/dev.
 
-    This is primarily intended for Kavia preview where the repo includes both:
+    This is primarily intended for Kavia preview where the repo includes:
     - oee_backend
     - oee_database (which writes db_connection.txt)
 
@@ -61,8 +61,14 @@ def _discover_db_connection_txt() -> Optional[Path]:
     1) DB_CONNECTION_PATH env var
     2) ./db_connection.txt (current working dir)
     3) <oee_backend>/db_connection.txt (relative to this file)
-    4) Any real-time-oee-monitoring-system-*/oee_database/db_connection.txt under repo root
+    4) Any real-time-oee-monitoring-system-*/oee_database/db_connection.txt while walking up parents
+       (supports multi-workspace layouts where backend and database live in sibling folders)
     5) Any parent/.../oee_database/db_connection.txt while walking up
+
+    Args:
+        start_file: Optional path used as the logical location of this module when searching.
+            This is intended for tests so discovery behavior can be validated without relying
+            on the actual repository layout.
     """
     env_path = (os.getenv("DB_CONNECTION_PATH") or "").strip()
     if env_path:
@@ -75,31 +81,33 @@ def _discover_db_connection_txt() -> Optional[Path]:
     candidates.append(Path.cwd() / "db_connection.txt")
 
     # session.py is at: <...>/oee_backend/src/db/session.py
-    this_file = Path(__file__).resolve()
+    this_file = (start_file or Path(__file__)).resolve()
     oee_backend_dir = this_file.parents[2]
     candidates.append(oee_backend_dir / "db_connection.txt")
 
-    # Try to find sibling workspace oee_database under the repo root
-    repo_root = this_file
-    for _ in range(10):
-        if (repo_root / ".project_manifest.yaml").exists():
-            break
-        if repo_root.parent == repo_root:
-            break
-        repo_root = repo_root.parent
-
-    # Known monorepo pattern: real-time-oee-monitoring-system-*/oee_database/db_connection.txt
-    try:
-        candidates.extend(repo_root.glob("real-time-oee-monitoring-system-*/oee_database/db_connection.txt"))
-    except OSError:
-        # If glob fails for any reason, ignore and rely on other candidates.
-        pass
+    # Multi-workspace layout support:
+    # Walk up parents and attempt to find sibling workspaces like:
+    #   <some_parent>/real-time-oee-monitoring-system-*/oee_database/db_connection.txt
+    for parent in this_file.parents:
+        try:
+            candidates.extend(
+                parent.glob("real-time-oee-monitoring-system-*/oee_database/db_connection.txt")
+            )
+        except OSError:
+            # Ignore glob issues (permissions, etc.) and fall back to other candidates.
+            pass
 
     # Walk up parents for a simple colocated pattern: <parent>/oee_database/db_connection.txt
     for parent in this_file.parents:
         candidates.append(parent / "oee_database" / "db_connection.txt")
 
+    # De-duplicate while preserving order
+    seen: set[str] = set()
     for p in candidates:
+        ps = str(p)
+        if ps in seen:
+            continue
+        seen.add(ps)
         if p.exists() and p.is_file():
             return p
 
